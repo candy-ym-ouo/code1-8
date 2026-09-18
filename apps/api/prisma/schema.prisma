@@ -85,6 +85,7 @@ model Recording {
   durationMs      Int
   status          RecordingStatus @default(UPLOADING)
   processingError String?
+  processingProgress Int         @default(0)
   version         Int             @default(1)
   createdById     String
   createdAt       DateTime        @default(now())
@@ -94,6 +95,7 @@ model Recording {
   clips           Clip[]
 
   @@index([workspaceId, updatedAt])
+  @@index([workspaceId, status, createdAt])
   @@index([createdById])
 }
 

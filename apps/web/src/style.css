@@ -223,6 +223,82 @@ aside {
   margin-top: 3px;
 }
 
+.filters {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.filter {
+  flex: 1;
+  padding: 6px 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #78716c;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.filter:hover {
+  background: #f4f1eb;
+}
+
+.filter.active {
+  background: #f1e9dc;
+  color: #b45309;
+}
+
+.recording-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.recording-body b {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.progress-bar {
+  display: block;
+  height: 4px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: #eeeae4;
+  overflow: hidden;
+}
+
+.progress-bar i {
+  display: block;
+  height: 100%;
+  background: #b45309;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.progress-bar.large {
+  height: 8px;
+  margin: 2px 0 14px;
+}
+
+.processing p {
+  margin: 0;
+}
+
+.load-more {
+  width: 100%;
+  margin-top: 10px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: #f1e9dc;
+  color: #b45309;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.load-more:hover {
+  background: #ecdfc9;
+}
+
 .empty {
   font-size: 13px;
   color: #a8a29e;

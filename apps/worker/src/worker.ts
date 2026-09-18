@@ -59,30 +59,81 @@ async function probeDurationMs(filePath: string): Promise<number> {
   }
 }
 
+// 状态机守卫：只有非终态（UPLOADING/PROCESSING）才允许继续流转，
+// READY/FAILED 为终态，一旦到达就不再接受任何回退写入。
+const ACTIVE_STATUSES = ['UPLOADING', 'PROCESSING'] as const;
+
+async function markProcessing(recordingId: string) {
+  await prisma.recording.updateMany({
+    where: { id: recordingId, status: { in: [...ACTIVE_STATUSES] } },
+    data: { status: 'PROCESSING', processingError: null },
+  });
+}
+
+async function markProgress(recordingId: string, progress: number) {
+  // 进度单调递增：只接受比当前值大的进度，且仅在非终态下更新
+  await prisma.recording.updateMany({
+    where: {
+      id: recordingId,
+      status: { in: [...ACTIVE_STATUSES] },
+      processingProgress: { lt: progress },
+    },
+    data: { processingProgress: progress },
+  });
+}
+
+async function markReady(recordingId: string, durationMs: number, playbackPath: string) {
+  const result = await prisma.recording.updateMany({
+    where: { id: recordingId, status: { in: [...ACTIVE_STATUSES] } },
+    data: {
+      status: 'READY',
+      processingProgress: 100,
+      durationMs,
+      playbackPath,
+      processingError: null,
+    },
+  });
+  return result.count > 0;
+}
+
+async function markFailed(recordingId: string, message: string) {
+  await prisma.recording.updateMany({
+    where: { id: recordingId, status: { in: [...ACTIVE_STATUSES] } },
+    data: { status: 'FAILED', processingError: message },
+  });
+}
+
 async function processMediaJob(job: Job) {
   const recordingId = String(job.data?.recordingId || '');
   if (!recordingId) throw new Error('任务缺少 recordingId');
 
   const recording = await prisma.recording.findUnique({ where: { id: recordingId } });
   if (!recording) throw new Error(`录音不存在: ${recordingId}`);
+  if (recording.status === 'READY' || recording.status === 'FAILED') {
+    // 终态幂等：任务已完成过，直接跳过，避免状态回退
+    return { recordingId, skipped: true };
+  }
 
-  await prisma.recording.update({
-    where: { id: recordingId },
-    data: { status: 'PROCESSING', processingError: null },
-  });
+  await markProcessing(recordingId);
+  await job.updateProgress(10);
+  await markProgress(recordingId, 10);
 
   const durationMs = await probeDurationMs(recording.originalPath);
   if (durationMs <= 0) throw new Error('音频时长为 0，无法进入编辑');
 
-  await prisma.recording.update({
-    where: { id: recordingId },
-    data: {
-      status: 'READY',
-      durationMs,
-      playbackPath: recording.playbackPath || recording.originalPath,
-      processingError: null,
-    },
-  });
+  await job.updateProgress(80);
+  await markProgress(recordingId, 80);
+
+  // 状态一次跃迁到 READY；若并发下已被推进到终态，本次写入放弃
+  const transitioned = await markReady(
+    recordingId,
+    durationMs,
+    recording.playbackPath || recording.originalPath,
+  );
+  await job.updateProgress(100);
+  if (!transitioned) {
+    return { recordingId, skipped: true };
+  }
 
   return { recordingId, durationMs };
 }
@@ -103,13 +154,15 @@ worker.on('failed', async (job, error) => {
   const maxAttempts = job.opts.attempts ?? 1;
   const hasAttemptsLeft = job.attemptsMade < maxAttempts;
   try {
-    await prisma.recording.update({
-      where: { id: String(recordingId) },
-      data: {
-        status: hasAttemptsLeft ? 'PROCESSING' : 'FAILED',
-        processingError: error.message,
-      },
-    });
+    if (hasAttemptsLeft) {
+      // 等待重试：保持 PROCESSING 并记录错误；守卫条件确保不会覆盖终态
+      await prisma.recording.updateMany({
+        where: { id: String(recordingId), status: { in: [...ACTIVE_STATUSES] } },
+        data: { status: 'PROCESSING', processingError: error.message },
+      });
+    } else {
+      await markFailed(String(recordingId), error.message);
+    }
   } catch (updateError) {
     console.error(`failed to persist media job error for ${recordingId}`, updateError);
   }

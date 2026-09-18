@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { mergePolledRecordings, type RecordingStatus } from '@history/contracts';
 import './style.css';
 
 const API = (import.meta.env.VITE_API_URL || 'http://localhost:4000').replace(/\/$/, '');
@@ -26,10 +27,30 @@ type Recording = {
   title: string;
   sizeBytes: string | number;
   durationMs: number;
-  status: 'UPLOADING' | 'PROCESSING' | 'READY' | 'FAILED';
+  status: RecordingStatus;
+  processingProgress: number;
   processingError?: string | null;
+  createdAt: string;
   _count?: { clips: number };
 };
+
+type RecordingListPage = {
+  items: Recording[];
+  nextCursor: string | null;
+};
+
+type StatusFilter = 'ALL' | 'ACTIVE' | 'READY' | 'FAILED';
+
+const STATUS_FILTERS: { key: StatusFilter; label: string; statuses: RecordingStatus[] | null }[] = [
+  { key: 'ALL', label: '全部', statuses: null },
+  { key: 'ACTIVE', label: '处理中', statuses: ['UPLOADING', 'PROCESSING'] },
+  { key: 'READY', label: '可编辑', statuses: ['READY'] },
+  { key: 'FAILED', label: '失败', statuses: ['FAILED'] },
+];
+
+const PAGE_SIZE = 30;
+const POLL_INTERVAL_MS = 2000;
+const MAX_POLL_WINDOW = 100;
 
 type Clip = {
   id: string;
@@ -189,23 +210,46 @@ function App() {
 function Workspace({ onLogout }: { onLogout: () => void }) {
   const [workspace, setWorkspace] = useState<WorkspaceModel | null>(null);
   const [recordings, setRecordings] = useState<Recording[]>([]);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
+  const loadedCount = useRef(0);
 
   const selected = useMemo(
     () => recordings.find((recording) => recording.id === selectedId) || null,
     [recordings, selectedId],
   );
 
-  const loadRecordings = useCallback(async () => {
-    if (!workspace) return;
-    const rows = await api<Recording[]>(`/v1/workspaces/${workspace.id}/recordings`);
-    setRecordings(rows);
-  }, [workspace]);
+  useEffect(() => {
+    loadedCount.current = recordings.length;
+  }, [recordings.length]);
+
+  const fetchRecordingsPage = useCallback(
+    (cursor?: string | null, limit: number = PAGE_SIZE) => {
+      if (!workspace) return Promise.reject(new Error('工作区尚未加载'));
+      const params = new URLSearchParams();
+      const filter = STATUS_FILTERS.find((item) => item.key === statusFilter);
+      if (filter?.statuses) params.set('status', filter.statuses.join(','));
+      params.set('limit', String(limit));
+      if (cursor) params.set('cursor', cursor);
+      return api<RecordingListPage>(
+        `/v1/workspaces/${workspace.id}/recordings?${params.toString()}`,
+      );
+    },
+    [workspace, statusFilter],
+  );
+
+  const reloadRecordings = useCallback(async () => {
+    const page = await fetchRecordingsPage();
+    setRecordings(page.items);
+    setNextCursor(page.nextCursor);
+  }, [fetchRecordingsPage]);
 
   useEffect(() => {
     let cancelled = false;
@@ -222,18 +266,12 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
           });
           workspaces = [created];
         }
-
-        const current = workspaces[0];
-        const rows = await api<Recording[]>(
-          `/v1/workspaces/${current.id}/recordings`,
-        );
-        if (cancelled) return;
-        setWorkspace(current);
-        setRecordings(rows);
+        if (!cancelled) setWorkspace(workspaces[0]);
       } catch (loadError) {
-        if (!cancelled) setError((loadError as Error).message);
-      } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setError((loadError as Error).message);
+          setLoading(false);
+        }
       }
     };
 
@@ -243,20 +281,61 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     };
   }, []);
 
+  // 初始加载与筛选变化：重新拉取第一页并重置游标
+  useEffect(() => {
+    if (!workspace) return;
+    let cancelled = false;
+
+    const loadFirstPage = async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const page = await fetchRecordingsPage();
+        if (cancelled) return;
+        setRecordings(page.items);
+        setNextCursor(page.nextCursor);
+      } catch (loadError) {
+        if (!cancelled) setError((loadError as Error).message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    void loadFirstPage();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace, fetchRecordingsPage]);
+
   const hasActiveProcessing = recordings.some(
     (recording) =>
       recording.status === 'UPLOADING' || recording.status === 'PROCESSING',
   );
 
+  // 轮询只刷新已加载窗口内的数据，按 id 原地合并：
+  // 列表顺序与分页游标保持稳定，状态/进度单调前进不回退
   useEffect(() => {
     if (!workspace || !hasActiveProcessing) return;
+    let cancelled = false;
+
     const timer = window.setInterval(() => {
-      void loadRecordings().catch((pollError) => {
-        setError((pollError as Error).message);
-      });
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [workspace, hasActiveProcessing, loadRecordings]);
+      void (async () => {
+        try {
+          const limit = Math.min(MAX_POLL_WINDOW, Math.max(loadedCount.current, PAGE_SIZE));
+          const page = await fetchRecordingsPage(null, limit);
+          if (cancelled) return;
+          setRecordings((current) => mergePolledRecordings(current, page.items));
+        } catch (pollError) {
+          if (!cancelled) setError((pollError as Error).message);
+        }
+      })();
+    }, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [workspace, hasActiveProcessing, fetchRecordingsPage]);
 
   useEffect(() => {
     if (!selected) {
@@ -283,6 +362,24 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     };
   }, [selected]);
 
+  const loadMore = async () => {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    setError('');
+    try {
+      const page = await fetchRecordingsPage(nextCursor);
+      setRecordings((current) => {
+        const seen = new Set(current.map((recording) => recording.id));
+        return [...current, ...page.items.filter((recording) => !seen.has(recording.id))];
+      });
+      setNextCursor(page.nextCursor);
+    } catch (loadError) {
+      setError((loadError as Error).message);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
   const upload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file || !workspace) return;
@@ -297,7 +394,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
         method: 'POST',
         body: form,
       });
-      await loadRecordings();
+      await reloadRecordings();
     } catch (uploadError) {
       setError((uploadError as Error).message);
     } finally {
@@ -335,33 +432,74 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               />
             </label>
           </div>
-          {busy && <div className="progress">正在上传，请勿关闭页面...</div>}
-          {error && <div className="error sidebar-error">{error}</div>}
-          {loading && <p className="empty">正在加载工作区...</p>}
-          {!loading &&
-            recordings.map((recording) => (
+          <div className="filters" role="tablist" aria-label="按状态筛选">
+            {STATUS_FILTERS.map((filter) => (
               <button
-                key={recording.id}
+                key={filter.key}
                 type="button"
-                className={`recording ${selectedId === recording.id ? 'active' : ''}`}
-                onClick={() => setSelectedId(recording.id)}
+                role="tab"
+                aria-selected={statusFilter === filter.key}
+                className={`filter ${statusFilter === filter.key ? 'active' : ''}`}
+                onClick={() => setStatusFilter(filter.key)}
               >
-                <span className="play">▶</span>
-                <span>
-                  <b>{recording.title}</b>
-                  <small>
-                    {recording.status === 'READY'
-                      ? '可编辑'
-                      : recording.status === 'FAILED'
-                        ? '处理失败'
-                        : '处理中'}{' '}
-                    · {recording._count?.clips || 0} 个片段
-                  </small>
-                </span>
+                {filter.label}
               </button>
             ))}
+          </div>
+          {busy && <div className="progress">正在上传，请勿关闭页面...</div>}
+          {error && <div className="error sidebar-error">{error}</div>}
+          {loading && <p className="empty">正在加载...</p>}
+          {!loading &&
+            recordings.map((recording) => {
+              const progress = Math.min(
+                100,
+                Math.max(0, Math.round(recording.processingProgress ?? 0)),
+              );
+              const active =
+                recording.status === 'UPLOADING' || recording.status === 'PROCESSING';
+              return (
+                <button
+                  key={recording.id}
+                  type="button"
+                  className={`recording ${selectedId === recording.id ? 'active' : ''}`}
+                  onClick={() => setSelectedId(recording.id)}
+                >
+                  <span className="play">▶</span>
+                  <span className="recording-body">
+                    <b>{recording.title}</b>
+                    <small>
+                      {recording.status === 'READY'
+                        ? '可编辑'
+                        : recording.status === 'FAILED'
+                          ? '处理失败'
+                          : `处理中 ${progress}%`}{' '}
+                      · {recording._count?.clips || 0} 个片段
+                    </small>
+                    {active && (
+                      <span className="progress-bar" aria-hidden="true">
+                        <i style={{ width: `${progress}%` }} />
+                      </span>
+                    )}
+                  </span>
+                </button>
+              );
+            })}
+          {!loading && nextCursor && (
+            <button
+              type="button"
+              className="load-more"
+              onClick={loadMore}
+              disabled={loadingMore}
+            >
+              {loadingMore ? '加载中...' : '加载更多'}
+            </button>
+          )}
           {!loading && !recordings.length && !busy && (
-            <p className="empty">上传一段访谈录音开始整理。</p>
+            <p className="empty">
+              {statusFilter === 'ALL'
+                ? '上传一段访谈录音开始整理。'
+                : '当前筛选下没有录音。'}
+            </p>
           )}
         </aside>
 
@@ -490,6 +628,10 @@ function Editor({
   };
 
   if (recording.status !== 'READY') {
+    const progress = Math.min(
+      100,
+      Math.max(0, Math.round(recording.processingProgress ?? 0)),
+    );
     return (
       <div className="editor">
         <div className="editor-head">
@@ -502,9 +644,16 @@ function Editor({
           </span>
         </div>
         <div className="processing">
-          {recording.status === 'FAILED'
-            ? `处理失败：${recording.processingError || '请稍后重试'}`
-            : '录音正在处理中，完成后即可创建片段。'}
+          {recording.status === 'FAILED' ? (
+            `处理失败：${recording.processingError || '请稍后重试'}`
+          ) : (
+            <>
+              <div className="progress-bar large" aria-hidden="true">
+                <i style={{ width: `${progress}%` }} />
+              </div>
+              <p>录音正在处理中（{progress}%），完成后即可创建片段。</p>
+            </>
+          )}
         </div>
       </div>
     );

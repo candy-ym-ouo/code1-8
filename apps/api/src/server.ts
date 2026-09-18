@@ -22,6 +22,9 @@ import {
   chapterUpdateSchema,
   clipSchema,
   clipUpdateSchema,
+  decodeRecordingCursor,
+  encodeRecordingCursor,
+  recordingListQuerySchema,
 } from '@history/contracts';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
@@ -106,7 +109,7 @@ await app.register(multipart, {
 });
 await app.register(websocket);
 
-function validationError<T>(schema: z.ZodType<T>, value: unknown): T {
+function validationError<S extends z.ZodTypeAny>(schema: S, value: unknown): z.output<S> {
   const parsed = schema.safeParse(value);
   if (!parsed.success) {
     throw new HttpError(400, 'INVALID_INPUT', '输入格式不正确', parsed.error.flatten());
@@ -455,8 +458,9 @@ app.post(
           },
         );
       } catch (error) {
-        await prisma.recording.update({
-          where: { id: recording.id },
+        // 仅在非终态下允许跃迁到 FAILED，避免覆盖已完成的终态
+        await prisma.recording.updateMany({
+          where: { id: recording.id, status: { in: ['UPLOADING', 'PROCESSING'] } },
           data: {
             status: 'FAILED',
             processingError: '媒体队列不可用，请稍后重试',
@@ -479,14 +483,54 @@ app.post(
 app.get('/v1/workspaces/:id/recordings', { preHandler: authenticate }, async (req) => {
   const workspaceId = (req.params as { id: string }).id;
   await requireMembership(req, workspaceId);
+  const query = validationError(recordingListQuerySchema, req.query);
+
+  const cursor = query.cursor ? decodeRecordingCursor(query.cursor) : null;
+  if (query.cursor && !cursor) {
+    throw new HttpError(400, 'INVALID_CURSOR', '分页游标无效');
+  }
+
+  const where: Prisma.RecordingWhereInput = {
+    workspaceId,
+    ...(query.status?.length ? { status: { in: query.status } } : {}),
+    ...(query.q ? { title: { contains: query.q, mode: 'insensitive' as const } } : {}),
+    ...(cursor
+      ? {
+          OR: [
+            { createdAt: { lt: new Date(cursor.createdAtMs) } },
+            {
+              createdAt: { equals: new Date(cursor.createdAtMs) },
+              id: { lt: cursor.id },
+            },
+          ],
+        }
+      : {}),
+  };
+
+  // 游标分页：按 (createdAt, id) 倒序，轮询期间新增记录不会导致游标漂移
   const rows = await prisma.recording.findMany({
-    where: { workspaceId },
+    where,
     include: {
       _count: { select: { clips: { where: { deletedAt: null } } } },
     },
-    orderBy: { createdAt: 'desc' },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: query.limit + 1,
   });
-  return { data: rows.map(recordingDto) };
+
+  const hasMore = rows.length > query.limit;
+  const items = hasMore ? rows.slice(0, query.limit) : rows;
+  const last = items[items.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? encodeRecordingCursor({ createdAtMs: last.createdAt.getTime(), id: last.id })
+      : null;
+
+  return {
+    data: {
+      items: items.map(recordingDto),
+      nextCursor,
+    },
+  };
 });
 
 app.get('/v1/recordings/:id/file', async (req, reply) => {

@@ -22,6 +22,8 @@ import {
   chapterUpdateSchema,
   clipSchema,
   clipUpdateSchema,
+  encodeRecordingCursor,
+  recordingListQuerySchema,
 } from '@history/contracts';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
@@ -106,7 +108,10 @@ await app.register(multipart, {
 });
 await app.register(websocket);
 
-function validationError<T>(schema: z.ZodType<T>, value: unknown): T {
+function validationError<Schema extends z.ZodTypeAny>(
+  schema: Schema,
+  value: unknown,
+): z.output<Schema> {
   const parsed = schema.safeParse(value);
   if (!parsed.success) {
     throw new HttpError(400, 'INVALID_INPUT', '输入格式不正确', parsed.error.flatten());
@@ -437,6 +442,7 @@ app.post(
           durationMs: 0,
           createdById: authUser(req).id,
           status: 'PROCESSING',
+          progress: 0,
         },
       });
 
@@ -479,14 +485,60 @@ app.post(
 app.get('/v1/workspaces/:id/recordings', { preHandler: authenticate }, async (req) => {
   const workspaceId = (req.params as { id: string }).id;
   await requireMembership(req, workspaceId);
+  const query = validationError(recordingListQuerySchema, req.query);
+
+  // ACTIVE 是仅用于筛选的虚拟状态：UPLOADING + PROCESSING
+  const statusFilter:
+    | { equals: 'UPLOADING' | 'PROCESSING' | 'READY' | 'FAILED' }
+    | { in: ('UPLOADING' | 'PROCESSING')[] }
+    | undefined =
+    query.status === undefined
+      ? undefined
+      : query.status === 'ACTIVE'
+        ? { in: ['UPLOADING', 'PROCESSING'] }
+        : { equals: query.status };
+
+  // 稳定游标：按 (createdAt desc, id desc) 做 keyset 分页，
+  // 轮询期间新插入的录音只会出现在首页之前，已拿到的页面不会发生位移或重复。
   const rows = await prisma.recording.findMany({
-    where: { workspaceId },
+    where: {
+      workspaceId,
+      ...(statusFilter ? { status: statusFilter } : {}),
+      ...(query.cursor
+        ? {
+            OR: [
+              { createdAt: { lt: new Date(query.cursor.createdAt) } },
+              {
+                createdAt: new Date(query.cursor.createdAt),
+                id: { lt: query.cursor.id },
+              },
+            ],
+          }
+        : {}),
+    },
     include: {
       _count: { select: { clips: { where: { deletedAt: null } } } },
     },
-    orderBy: { createdAt: 'desc' },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: query.limit + 1,
   });
-  return { data: rows.map(recordingDto) };
+
+  const hasMore = rows.length > query.limit;
+  const items = rows.slice(0, query.limit);
+  const lastItem = items[items.length - 1];
+
+  return {
+    data: {
+      items: items.map(recordingDto),
+      nextCursor:
+        hasMore && lastItem
+          ? encodeRecordingCursor({
+              createdAt: lastItem.createdAt,
+              id: lastItem.id,
+            })
+          : null,
+    },
+  };
 });
 
 app.get('/v1/recordings/:id/file', async (req, reply) => {

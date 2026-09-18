@@ -21,14 +21,25 @@ type WorkspaceModel = {
   timezone: string;
 };
 
+type RecordingStatus = 'UPLOADING' | 'PROCESSING' | 'READY' | 'FAILED';
+
+/** ACTIVE 是仅用于筛选的虚拟状态，等价于 UPLOADING + PROCESSING */
+type RecordingStatusFilter = RecordingStatus | 'ACTIVE';
+
 type Recording = {
   id: string;
   title: string;
   sizeBytes: string | number;
   durationMs: number;
-  status: 'UPLOADING' | 'PROCESSING' | 'READY' | 'FAILED';
+  status: RecordingStatus;
   processingError?: string | null;
+  progress: number;
   _count?: { clips: number };
+};
+
+type RecordingPage = {
+  items: Recording[];
+  nextCursor: string | null;
 };
 
 type Clip = {
@@ -186,26 +197,160 @@ function App() {
   );
 }
 
+const STATUS_RANK: Record<RecordingStatus, number> = {
+  UPLOADING: 0,
+  PROCESSING: 1,
+  FAILED: 2,
+  READY: 3,
+};
+
+const STATUS_FILTERS: { value: RecordingStatusFilter | 'ALL'; label: string }[] =
+  [
+    { value: 'ALL', label: '全部' },
+    { value: 'ACTIVE', label: '处理中' },
+    { value: 'READY', label: '可编辑' },
+    { value: 'FAILED', label: '失败' },
+  ];
+
+const PAGE_LIMIT = 20;
+
+function isActiveStatus(status: RecordingStatus) {
+  return status === 'UPLOADING' || status === 'PROCESSING';
+}
+
+/**
+ * 服务端是唯一事实来源，但轮询请求可能乱序返回。这里再做一层防御：
+ * 状态只能向前跃迁（READY 永远不会被旧响应刷回 PROCESSING），进度也不允许倒退。
+ */
+function reconcileRecording(
+  previous: Recording | undefined,
+  incoming: Recording,
+): Recording {
+  if (!previous) return incoming;
+  const status =
+    STATUS_RANK[incoming.status] >= STATUS_RANK[previous.status]
+      ? incoming.status
+      : previous.status;
+  return {
+    ...incoming,
+    status,
+    progress: Math.max(previous.progress || 0, incoming.progress || 0),
+  };
+}
+
+/**
+ * 用服务端最新一页整体替换本地页；仅以旧数据做防回退对照，
+ * 不保留已从该页消失的录音（例如在“处理中”筛选下已完成的条目）。
+ */
+function reconcileList(
+  previous: Recording[],
+  incoming: Recording[],
+): Recording[] {
+  const byId = new Map(previous.map((recording) => [recording.id, recording]));
+  return incoming.map((recording) =>
+    reconcileRecording(byId.get(recording.id), recording),
+  );
+}
+
+function statusLabel(status: RecordingStatus) {
+  if (status === 'READY') return '可编辑';
+  if (status === 'FAILED') return '处理失败';
+  if (status === 'UPLOADING') return '排队中';
+  return '处理中';
+}
+
 function Workspace({ onLogout }: { onLogout: () => void }) {
   const [workspace, setWorkspace] = useState<WorkspaceModel | null>(null);
-  const [recordings, setRecordings] = useState<Recording[]>([]);
+  // 每页单独记录它请求时使用的游标；轮询时逐页用各自的“稳定游标”重放，
+  // 新录音只会出现在首页之前，已加载页面不会位移、重复或漏项。
+  const [pages, setPages] = useState<{ cursor: string | null; items: Recording[] }[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] =
+    useState<RecordingStatusFilter | 'ALL'>('ALL');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
+  // 每次筛选切换 / 翻页都开启新的一代，乱序返回的旧轮询响应会被丢弃。
+  const fetchGeneration = useRef(0);
+
+  const recordings = useMemo(() => {
+    // 稳定游标 + 服务端筛选时，离开筛选集的录音会让相邻页窗口重叠，
+    // 这里按 id 跨页去重（较早的页优先），保证同一条只出现一次。
+    const seen = new Set<string>();
+    return pages
+      .flatMap((page) => page.items)
+      .filter((recording) => {
+        if (seen.has(recording.id)) return false;
+        seen.add(recording.id);
+        return true;
+      });
+  }, [pages]);
 
   const selected = useMemo(
     () => recordings.find((recording) => recording.id === selectedId) || null,
     [recordings, selectedId],
   );
 
-  const loadRecordings = useCallback(async () => {
+  const recordingsPath = useCallback(
+    (cursor: string | null) => {
+      const params = new URLSearchParams({ limit: String(PAGE_LIMIT) });
+      if (statusFilter !== 'ALL') params.set('status', statusFilter);
+      if (cursor) params.set('cursor', cursor);
+      if (!workspace) throw new Error('workspace not ready');
+      return `/v1/workspaces/${workspace.id}/recordings?${params.toString()}`;
+    },
+    [workspace, statusFilter],
+  );
+
+  // 重新拉取已经加载过的所有页面；游标沿用各页当前的稳定游标。
+  const refreshRecordings = useCallback(
+    async (generation: number) => {
+      if (!workspace || pages.length === 0) return;
+      const cursors = pages.map((page) => page.cursor);
+      const results = await Promise.all(
+        cursors.map((cursor) =>
+          api<RecordingPage>(recordingsPath(cursor)),
+        ),
+      );
+      if (generation !== fetchGeneration.current) return;
+
+      // 结果与请求一一对应；整页以服务端为准替换，空页丢弃。
+      // 相邻页窗口可能因条目离开筛选集而重叠，最终展示时再按 id 去重。
+      const nextPages = results
+        .map((result, index) => ({
+          cursor: pages[index]?.cursor ?? null,
+          items: reconcileList(pages[index]?.items ?? [], result.items),
+        }))
+        .filter((page) => page.items.length > 0);
+      setPages(nextPages);
+      setNextCursor(results[results.length - 1]?.nextCursor ?? null);
+    },
+    [workspace, pages, recordingsPath],
+  );
+
+  // 仅切换筛选或首次加载时调用：从游标 null 开始，重置所有页面。
+  const loadFirstPage = useCallback(async () => {
     if (!workspace) return;
-    const rows = await api<Recording[]>(`/v1/workspaces/${workspace.id}/recordings`);
-    setRecordings(rows);
-  }, [workspace]);
+    const generation = ++fetchGeneration.current;
+    setLoading(true);
+    setError('');
+    try {
+      const page = await api<RecordingPage>(recordingsPath(null));
+      if (generation !== fetchGeneration.current) return;
+      setPages(page.items.length ? [{ cursor: null, items: page.items }] : []);
+      setNextCursor(page.nextCursor);
+    } catch (loadError) {
+      if (generation === fetchGeneration.current) {
+        setError((loadError as Error).message);
+      }
+    } finally {
+      if (generation === fetchGeneration.current) setLoading(false);
+    }
+  }, [workspace, recordingsPath]);
 
   useEffect(() => {
     let cancelled = false;
@@ -224,12 +369,16 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
         }
 
         const current = workspaces[0];
-        const rows = await api<Recording[]>(
-          `/v1/workspaces/${current.id}/recordings`,
-        );
         if (cancelled) return;
         setWorkspace(current);
-        setRecordings(rows);
+
+        const page = await api<RecordingPage>(
+          `/v1/workspaces/${current.id}/recordings?limit=${PAGE_LIMIT}`,
+        );
+        if (cancelled) return;
+        fetchGeneration.current += 1;
+        setPages(page.items.length ? [{ cursor: null, items: page.items }] : []);
+        setNextCursor(page.nextCursor);
       } catch (loadError) {
         if (!cancelled) setError((loadError as Error).message);
       } finally {
@@ -243,20 +392,47 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     };
   }, []);
 
-  const hasActiveProcessing = recordings.some(
-    (recording) =>
-      recording.status === 'UPLOADING' || recording.status === 'PROCESSING',
+  // 筛选变化时由服务端重新筛选，从首页重新开始。
+  useEffect(() => {
+    if (!workspace) return;
+    void loadFirstPage();
+  }, [workspace, loadFirstPage]);
+
+  const loadMore = async () => {
+    if (!workspace || nextCursor === null || loadingMore) return;
+    const generation = fetchGeneration.current;
+    setLoadingMore(true);
+    setError('');
+    try {
+      const page = await api<RecordingPage>(recordingsPath(nextCursor));
+      if (generation !== fetchGeneration.current) return;
+      setPages((current) => [
+        ...current,
+        { cursor: nextCursor, items: page.items },
+      ]);
+      setNextCursor(page.nextCursor);
+    } catch (loadError) {
+      if (generation === fetchGeneration.current) {
+        setError((loadError as Error).message);
+      }
+    } finally {
+      if (generation === fetchGeneration.current) setLoadingMore(false);
+    }
+  };
+
+  const hasActiveProcessing = recordings.some((recording) =>
+    isActiveStatus(recording.status),
   );
 
   useEffect(() => {
     if (!workspace || !hasActiveProcessing) return;
     const timer = window.setInterval(() => {
-      void loadRecordings().catch((pollError) => {
+      void refreshRecordings(fetchGeneration.current).catch((pollError) => {
         setError((pollError as Error).message);
       });
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [workspace, hasActiveProcessing, loadRecordings]);
+  }, [workspace, hasActiveProcessing, refreshRecordings]);
 
   useEffect(() => {
     if (!selected) {
@@ -281,7 +457,7 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, [selected]);
+  }, [selected?.id, selected?.status]);
 
   const upload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -297,7 +473,13 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
         method: 'POST',
         body: form,
       });
-      await loadRecordings();
+      // 新录音一定在处理中：切到“处理中”筛选并回到首页，确保它立即可见。
+      setSelectedId(null);
+      if (statusFilter === 'ACTIVE') {
+        await loadFirstPage();
+      } else {
+        setStatusFilter('ACTIVE');
+      }
     } catch (uploadError) {
       setError((uploadError as Error).message);
     } finally {
@@ -335,6 +517,21 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
               />
             </label>
           </div>
+          <div className="filters" role="group" aria-label="按处理状态筛选">
+            {STATUS_FILTERS.map((filter) => (
+              <button
+                key={filter.value}
+                type="button"
+                className={`filter ${statusFilter === filter.value ? 'active' : ''}`}
+                onClick={() => {
+                  setSelectedId(null);
+                  setStatusFilter(filter.value);
+                }}
+              >
+                {filter.label}
+              </button>
+            ))}
+          </div>
           {busy && <div className="progress">正在上传，请勿关闭页面...</div>}
           {error && <div className="error sidebar-error">{error}</div>}
           {loading && <p className="empty">正在加载工作区...</p>}
@@ -350,18 +547,40 @@ function Workspace({ onLogout }: { onLogout: () => void }) {
                 <span>
                   <b>{recording.title}</b>
                   <small>
-                    {recording.status === 'READY'
-                      ? '可编辑'
-                      : recording.status === 'FAILED'
-                        ? '处理失败'
-                        : '处理中'}{' '}
-                    · {recording._count?.clips || 0} 个片段
+                    {statusLabel(recording.status)} ·{' '}
+                    {recording._count?.clips || 0} 个片段
                   </small>
+                  {isActiveStatus(recording.status) && (
+                    <span
+                      className="progress-bar"
+                      role="progressbar"
+                      aria-valuenow={recording.progress}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                    >
+                      <i style={{ width: `${recording.progress}%` }} />
+                      <em>{recording.progress}%</em>
+                    </span>
+                  )}
                 </span>
               </button>
             ))}
           {!loading && !recordings.length && !busy && (
-            <p className="empty">上传一段访谈录音开始整理。</p>
+            <p className="empty">
+              {statusFilter === 'ALL'
+                ? '上传一段访谈录音开始整理。'
+                : '当前筛选下没有录音。'}
+            </p>
+          )}
+          {!loading && nextCursor !== null && recordings.length > 0 && (
+            <button
+              type="button"
+              className="load-more"
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+            >
+              {loadingMore ? '加载中...' : '加载更多'}
+            </button>
           )}
         </aside>
 
@@ -502,9 +721,23 @@ function Editor({
           </span>
         </div>
         <div className="processing">
-          {recording.status === 'FAILED'
-            ? `处理失败：${recording.processingError || '请稍后重试'}`
-            : '录音正在处理中，完成后即可创建片段。'}
+          {recording.status === 'FAILED' ? (
+            `处理失败：${recording.processingError || '请稍后重试'}`
+          ) : (
+            <>
+              <p>录音正在处理中，完成后即可创建片段。</p>
+              <span
+                className="progress-bar large"
+                role="progressbar"
+                aria-valuenow={recording.progress}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              >
+                <i style={{ width: `${recording.progress}%` }} />
+                <em>{recording.progress}%</em>
+              </span>
+            </>
+          )}
         </div>
       </div>
     );

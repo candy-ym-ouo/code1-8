@@ -38,6 +38,7 @@ pnpm build
 - `POST /v1/auth/register`、`POST /v1/auth/login`
 - `GET/POST /v1/workspaces`
 - `POST /v1/workspaces/:id/recordings/uploads`
+- `GET /v1/workspaces/:id/recordings?status=...&cursor=...&limit=...`（服务端筛选 + 稳定游标分页；`status` 支持 `UPLOADING/PROCESSING/READY/FAILED` 以及表示前两者合集的虚拟值 `ACTIVE`，响应为 `{ items, nextCursor }`，录音含 0-100 的 `progress` 进度字段）
 - `GET /v1/recordings/:id/file`（支持 HTTP Range）
 - `GET/POST /v1/recordings/:id/clips`
 - `PATCH /v1/clips/:id`（乐观锁，版本冲突返回 409）
